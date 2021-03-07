@@ -1,13 +1,16 @@
 ---
-name: Tune Existing Rule
+name: Tune existing rule
 about: Suggestion for logic changes to an existing rule
 title: "[Rule Tuning] Name of rule"
-labels: rule-tuning
+labels: "Rule: Tuning"
 assignees: ''
 
 ---
 
-<!-- Before submitting an issue to tune a rule, be sure you first understand the [information on rules](../../docs/rules-info.md) --->
+<!-- Before submitting an issue to tune a rule, be sure to reference CONTRIBUTING.md --->
+
+## Link to rule
+
 
 ## Description
 <!-- Provide a detailed description of the suggested changes -->

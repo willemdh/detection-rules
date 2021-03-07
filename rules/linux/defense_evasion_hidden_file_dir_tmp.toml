@@ -1,8 +1,7 @@
 [metadata]
 creation_date = "2020/04/29"
-ecs_version = ["1.4.0"]
 maturity = "production"
-updated_date = "2020/04/29"
+updated_date = "2020/12/17"
 
 [rule]
 author = ["Elastic"]
@@ -17,7 +16,8 @@ false_positives = [
     behavior. These events can be filtered by the process arguments, username, or process name values.
     """,
 ]
-index = ["auditbeat-*"]
+from = "now-9m"
+index = ["auditbeat-*", "logs-endpoint.events.*"]
 language = "lucene"
 license = "Elastic License"
 max_signals = 33
@@ -25,20 +25,28 @@ name = "Creation of Hidden Files and Directories"
 risk_score = 47
 rule_id = "b9666521-4742-49ce-9ddc-b8e84c35acae"
 severity = "medium"
-tags = ["Elastic", "Linux"]
+tags = ["Elastic", "Host", "Linux", "Threat Detection", "Defense Evasion"]
 type = "query"
 
 query = '''
-event.action:executed AND process.working_directory:("/tmp" or "/var/tmp" or "/dev/shm") AND process.args:/\.[a-zA-Z0-9_\-][a-zA-Z0-9_\-\.]{1,254}/ AND NOT process.name:(cd or ls or find)
+event.category:process AND event.type:(start or process_started) AND
+  process.working_directory:("/tmp" or "/var/tmp" or "/dev/shm") AND
+  process.args:/\.[a-zA-Z0-9_\-][a-zA-Z0-9_\-\.]{1,254}/ AND
+  NOT process.name:(ls or find)
 '''
 
 
 [[rule.threat]]
 framework = "MITRE ATT&CK"
 [[rule.threat.technique]]
-id = "T1158"
+id = "T1564"
+name = "Hide Artifacts"
+reference = "https://attack.mitre.org/techniques/T1564/"
+[[rule.threat.technique.subtechnique]]
+id = "T1564.001"
 name = "Hidden Files and Directories"
-reference = "https://attack.mitre.org/techniques/T1158/"
+reference = "https://attack.mitre.org/techniques/T1564/001/"
+
 
 
 [rule.threat.tactic]
@@ -47,11 +55,6 @@ name = "Defense Evasion"
 reference = "https://attack.mitre.org/tactics/TA0005/"
 [[rule.threat]]
 framework = "MITRE ATT&CK"
-[[rule.threat.technique]]
-id = "T1158"
-name = "Hidden Files and Directories"
-reference = "https://attack.mitre.org/techniques/T1158/"
-
 
 [rule.threat.tactic]
 id = "TA0003"

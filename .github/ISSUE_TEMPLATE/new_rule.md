@@ -1,31 +1,45 @@
 ---
-name: New Rule
+name: New rule
 about: Suggestions and ideas for new rules
-title: "[New Rule] "
-labels: new-rule
+title: "[New Rule] Name of rule"
+labels: "Rule: New"
 assignees: ''
 
 ---
+
+<!-- Before submitting an issue to tune a rule, be sure to reference CONTRIBUTING.md --->
+
 ## Description
 <!-- Provide a detailed description of the activity to be detected -->
 
 
 ## Required Info
 
-- **Eventing Sources:**
-<!-- filebeat, sysmon, etc. -->
+### Target indexes
+<!-- filebeat-*, logs-windows.*, etc. -->
 
-- **Target Operating Systems:**
+### Additional requirements
+<!-- sysmon, beats config modification, etc. -->
+
+### Target Operating Systems
 <!-- windows, linux, macOS, etc -->
 
-- **Platforms**
+### Platforms
 <!-- okta, cloudtrail, etc -->
 
-- **Target ECS Version:** x.x.x
-- **New fields required in ECS for this? Associated issue/PR:**
+### Tested ECS Version
+x.x.x
+
 
 ## Optional Info
-- **References:**
+
+### Query
+
+### New fields required in ECS/data sources for this rule?
+
+### Related issues or PRs
+
+### References
 
 
 

@@ -4,65 +4,111 @@
 
 """CLI commands for detection_rules."""
 import glob
-import io
 import json
 import os
+import re
+import time
+from pathlib import Path
+from typing import Dict
 
 import click
 import jsonschema
 import pytoml
-from eql import load_dump
 
-from .misc import nested_set
 from . import rule_loader
-from .packaging import PACKAGE_FILE, Package, manage_versions
-from .rule import RULE_TYPE_OPTIONS, Rule
+from .misc import client_error, nested_set, parse_config
+from .rule import Rule
 from .rule_formatter import toml_write
-from .utils import get_path, clear_caches
+from .schemas import CurrentSchema, available_versions
+from .utils import get_path, clear_caches, load_rule_contents
 
 
 RULES_DIR = get_path('rules')
 
 
 @click.group('detection-rules', context_settings={'help_option_names': ['-h', '--help']})
-def root():
+@click.option('--debug/--no-debug', '-D/-N', is_flag=True, default=None,
+              help='Print full exception stacktrace on errors')
+@click.pass_context
+def root(ctx, debug):
     """Commands for detection-rules repository."""
+    debug = debug if debug is not None else parse_config().get('debug')
+    ctx.obj = {'debug': debug}
+    if debug:
+        click.secho('DEBUG MODE ENABLED', fg='yellow')
 
 
 @root.command('create-rule')
 @click.argument('path', type=click.Path(dir_okay=False))
 @click.option('--config', '-c', type=click.Path(exists=True, dir_okay=False), help='Rule or config file')
 @click.option('--required-only', is_flag=True, help='Only prompt for required fields')
-@click.option('--rule-type', '-t', type=click.Choice(RULE_TYPE_OPTIONS), help='Type of rule to create')
+@click.option('--rule-type', '-t', type=click.Choice(CurrentSchema.RULE_TYPES), help='Type of rule to create')
 def create_rule(path, config, required_only, rule_type):
     """Create a detection rule."""
-    config = load_dump(config) if config else {}
+    contents = load_rule_contents(config, single_only=True)[0] if config else {}
     try:
-        return Rule.build(path, rule_type=rule_type, required_only=required_only, save=True, **config)
+        return Rule.build(path, rule_type=rule_type, required_only=required_only, save=True, **contents)
     finally:
         rule_loader.reset()
 
 
-@root.command('load-from-file')
+@root.command('generate-rules-index')
+@click.option('--query', '-q', help='Optional KQL query to limit to specific rules')
+@click.option('--overwrite', is_flag=True, help='Overwrite files in an existing folder')
+@click.pass_context
+def generate_rules_index(ctx: click.Context, query, overwrite, save_files=True):
+    """Generate enriched indexes of rules, based on a KQL search, for indexing/importing into elasticsearch/kibana."""
+    from . import rule_loader
+    from .packaging import load_current_package_version, Package
+
+    if query:
+        rule_paths = [r['file'] for r in ctx.invoke(search_rules, query=query, verbose=False)]
+        rules = rule_loader.load_rules(rule_loader.load_rule_files(paths=rule_paths, verbose=False), verbose=False)
+        rules = rules.values()
+    else:
+        rules = rule_loader.load_rules(verbose=False).values()
+
+    rule_count = len(rules)
+    package = Package(rules, load_current_package_version(), verbose=False)
+    package_hash = package.get_package_hash()
+    bulk_upload_docs, importable_rules_docs = package.create_bulk_index_body()
+
+    if save_files:
+        path = Path(get_path('enriched-rule-indexes', package_hash))
+        path.mkdir(parents=True, exist_ok=overwrite)
+        bulk_upload_docs.dump(path.joinpath('enriched-rules-index-uploadable.ndjson'), sort_keys=True)
+        importable_rules_docs.dump(path.joinpath('enriched-rules-index-importable.ndjson'), sort_keys=True)
+
+        click.echo(f'files saved to: {path}')
+
+    click.echo(f'{rule_count} rules included')
+
+    return bulk_upload_docs, importable_rules_docs
+
+
+@root.command('import-rules')
 @click.argument('infile', type=click.Path(dir_okay=False, exists=True), nargs=-1, required=False)
 @click.option('--directory', '-d', type=click.Path(file_okay=False, exists=True), help='Load files from a directory')
-def load_from_file(infile, directory):
-    """Load rules from file(s)."""
-    if infile:
-        for rule_file in infile:
-            rule_path = os.path.join(RULES_DIR, os.path.basename(rule_file))
-            rule = Rule(rule_path, load_dump(rule_file))
-            rule.save(as_rule=True, verbose=True)
-    elif directory:
-        for rule_file in glob.glob(os.path.join(directory, '**', '*.*'), recursive=True):
-            try:
-                rule_path = os.path.join(RULES_DIR, os.path.basename(rule_file))
-                rule = Rule(rule_path, load_dump(rule_file))
-                rule.save(as_rule=True, verbose=True)
-            except ValueError:
-                click.echo('Unable to load file: {}'.format(rule_file))
-    else:
-        click.echo('No files specified!')
+def import_rules(infile, directory):
+    """Import rules from json, toml, or Kibana exported rule file(s)."""
+    rule_files = glob.glob(os.path.join(directory, '**', '*.*'), recursive=True) if directory else []
+    rule_files = sorted(set(rule_files + list(infile)))
+
+    rule_contents = []
+    for rule_file in rule_files:
+        rule_contents.extend(load_rule_contents(rule_file))
+
+    if not rule_contents:
+        click.echo('Must specify at least one file!')
+
+    def name_to_filename(name):
+        return re.sub(r'[^_a-z0-9]+', '_', name.strip().lower()).strip('_') + '.toml'
+
+    for contents in rule_contents:
+        base_path = contents.get('name') or contents.get('rule', {}).get('name')
+        base_path = name_to_filename(base_path) if base_path else base_path
+        rule_path = os.path.join(RULES_DIR, base_path) if base_path else None
+        Rule.build(rule_path, required_only=True, save=True, verbose=True, **contents)
 
 
 @root.command('toml-lint')
@@ -74,7 +120,7 @@ def toml_lint(rule_file):
         rule = Rule(path=rule_file.name, contents=contents)
 
         # removed unneeded defaults
-        for field in rule_loader.find_unneeded_defaults(rule):
+        for field in rule_loader.find_unneeded_defaults_from_rule(rule):
             rule.contents.pop(field, None)
 
         rule.save(as_rule=True)
@@ -82,7 +128,7 @@ def toml_lint(rule_file):
         for rule in rule_loader.load_rules().values():
 
             # removed unneeded defaults
-            for field in rule_loader.find_unneeded_defaults(rule):
+            for field in rule_loader.find_unneeded_defaults_from_rule(rule):
                 rule.contents.pop(field, None)
 
             rule.save(as_rule=True)
@@ -93,105 +139,137 @@ def toml_lint(rule_file):
 
 @root.command('mass-update')
 @click.argument('query')
+@click.option('--metadata', '-m', is_flag=True, help='Make an update to the rule metadata rather than contents.')
+@click.option('--language', type=click.Choice(["eql", "kql"]), default="kql")
 @click.option('--field', type=(str, str), multiple=True,
               help='Use rule-search to retrieve a subset of rules and modify values '
                    '(ex: --field management.ecs_version 1.1.1).\n'
                    'Note this is limited to string fields only. Nested fields should use dot notation.')
 @click.pass_context
-def mass_update(ctx, query, field):
+def mass_update(ctx, query, metadata, language, field):
     """Update multiple rules based on eql results."""
-    results = ctx.invoke(search_rules, query=query, verbose=False)
-    rules = [rule_loader.get_rule(r['rule_id']) for r in results]
+    results = ctx.invoke(search_rules, query=query, language=language, verbose=False)
+    rules = [rule_loader.get_rule(r['rule_id'], verbose=False) for r in results]
 
     for rule in rules:
         for key, value in field:
-            nested_set(rule.contents, key, value)
+            nested_set(rule.metadata if metadata else rule.contents, key, value)
 
         rule.validate(as_rule=True)
-        rule.save()
+        rule.save(as_rule=True)
 
-    return ctx.invoke(search_rules, query=query, columns=[k[0].split('.')[-1] for k in field])
+    return ctx.invoke(search_rules, query=query, language=language,
+                      columns=['rule_id', 'name'] + [k[0].split('.')[-1] for k in field])
 
 
 @root.command('view-rule')
 @click.argument('rule-id', required=False)
 @click.option('--rule-file', '-f', type=click.Path(dir_okay=False), help='Optionally view a rule from a specified file')
-@click.option('--as-api/--as-rule', default=True, help='Print the rule in final api or rule format')
-def view_rule(rule_id, rule_file, as_api):
+@click.option('--api-format/--rule-format', default=True, help='Print the rule in final api or rule format')
+@click.pass_context
+def view_rule(ctx, rule_id, rule_file, api_format, verbose=True):
     """View an internal rule or specified rule file."""
+    rule = None
+
     if rule_id:
         rule = rule_loader.get_rule(rule_id, verbose=False)
     elif rule_file:
-        rule = Rule(rule_file, load_dump(rule_file))
+        contents = {k: v for k, v in load_rule_contents(rule_file, single_only=True)[0].items() if v}
+
+        try:
+            rule = Rule(rule_file, contents)
+        except jsonschema.ValidationError as e:
+            client_error(f'Rule: {rule_id or os.path.basename(rule_file)} failed validation', e, ctx=ctx)
     else:
-        click.secho('Unknown rule!', fg='red')
-        return
+        client_error('Unknown rule!')
 
     if not rule:
-        click.secho('Unknown format!', fg='red')
-        return
+        client_error('Unknown format!')
 
-    click.echo(toml_write(rule.rule_format()) if not as_api else json.dumps(rule.contents, indent=2, sort_keys=True))
+    if verbose:
+        click.echo(toml_write(rule.rule_format()) if not api_format else
+                   json.dumps(rule.get_payload(), indent=2, sort_keys=True))
 
     return rule
+
+
+@root.command('export-rules')
+@click.argument('rule-id', nargs=-1, required=False)
+@click.option('--rule-file', '-f', multiple=True, type=click.Path(dir_okay=False), help='Export specified rule files')
+@click.option('--directory', '-d', multiple=True, type=click.Path(file_okay=False),
+              help='Recursively export rules from a directory')
+@click.option('--outfile', '-o', default=get_path('exports', f'{time.strftime("%Y%m%dT%H%M%SL")}.ndjson'),
+              type=click.Path(dir_okay=False), help='Name of file for exported rules')
+@click.option('--replace-id', '-r', is_flag=True, help='Replace rule IDs with new IDs before export')
+@click.option('--stack-version', type=click.Choice(available_versions),
+              help='Downgrade a rule version to be compatible with older instances of Kibana')
+@click.option('--skip-unsupported', '-s', is_flag=True,
+              help='If `--stack-version` is passed, skip rule types which are unsupported '
+                   '(an error will be raised otherwise)')
+def export_rules(rule_id, rule_file, directory, outfile, replace_id, stack_version, skip_unsupported):
+    """Export rule(s) into an importable ndjson file."""
+    from .packaging import Package
+
+    if not (rule_id or rule_file or directory):
+        client_error('Required: at least one of --rule-id, --rule-file, or --directory')
+
+    if rule_id:
+        all_rules = {r.id: r for r in rule_loader.load_rules(verbose=False).values()}
+        missing = [rid for rid in rule_id if rid not in all_rules]
+
+        if missing:
+            client_error(f'Unknown rules for rule IDs: {", ".join(missing)}')
+
+        rules = [r for r in all_rules.values() if r.id in rule_id]
+        rule_ids = [r.id for r in rules]
+    else:
+        rules = []
+        rule_ids = []
+
+    rule_files = list(rule_file)
+    for dirpath in directory:
+        rule_files.extend(list(Path(dirpath).rglob('*.toml')))
+
+    file_lookup = rule_loader.load_rule_files(verbose=False, paths=rule_files)
+    rules_from_files = rule_loader.load_rules(file_lookup=file_lookup).values() if file_lookup else []
+
+    # rule_loader.load_rules handles checks for duplicate rule IDs - this means rules loaded by ID are de-duped and
+    #   rules loaded from files and directories are de-duped from each other, so this check is to ensure that there is
+    #   no overlap between the two sets of rules
+    duplicates = [r.id for r in rules_from_files if r.id in rule_ids]
+    if duplicates:
+        client_error(f'Duplicate rules for rule IDs: {", ".join(duplicates)}')
+
+    rules.extend(rules_from_files)
+
+    if replace_id:
+        from uuid import uuid4
+        for rule in rules:
+            rule.contents['rule_id'] = str(uuid4())
+
+    Path(outfile).parent.mkdir(exist_ok=True)
+    package = Package(rules, '_', verbose=False)
+    package.export(outfile, downgrade_version=stack_version, skip_unsupported=skip_unsupported)
+    return package.rules
 
 
 @root.command('validate-rule')
 @click.argument('rule-id', required=False)
 @click.option('--rule-name', '-n')
 @click.option('--path', '-p', type=click.Path(dir_okay=False))
-def validate_rule(rule_id, rule_name, path):
-    """Check if a rule staged in rules dir validates against a schema."""
-    rule = rule_loader.get_rule(rule_id, rule_name, path, verbose=False)
-
-    if not rule:
-        return click.secho('Rule not found!', fg='red')
-
-    try:
-        rule.validate(as_rule=True)
-    except jsonschema.ValidationError as e:
-        click.echo(e)
-
-    click.echo('Rule validation successful')
-
-    return rule
-
-
-license_header = """
-# Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
-# or more contributor license agreements. Licensed under the Elastic License;
-# you may not use this file except in compliance with the Elastic License.
-""".strip()
-
-
-@root.command('license-check')
 @click.pass_context
-def license_check(ctx):
-    """Check that all code files contain a valid license."""
+def validate_rule(ctx, rule_id, rule_name, path):
+    """Check if a rule staged in rules dir validates against a schema."""
+    try:
+        rule = rule_loader.get_rule(rule_id, rule_name, path, verbose=False)
+        if not rule:
+            client_error('Rule not found!')
 
-    failed = False
-
-    for path in glob.glob(get_path("**", "*.py"), recursive=True):
-        if path.startswith(get_path("env", "")):
-            continue
-
-        relative_path = os.path.relpath(path)
-
-        with io.open(path, "rt", encoding="utf-8") as f:
-            contents = f.read()
-
-            # skip over shebang lines
-            if contents.startswith("#!/"):
-                _, _, contents = contents.partition("\n")
-
-            if not contents.lstrip("\r\n").startswith(license_header):
-                if not failed:
-                    click.echo("Missing license headers for:", err=True)
-
-                failed = True
-                click.echo(relative_path, err=True)
-
-    ctx.exit(int(failed))
+        rule.validate(as_rule=True)
+        click.echo('Rule validation successful')
+        return rule
+    except jsonschema.ValidationError as e:
+        client_error(e.args[0], e, ctx=ctx)
 
 
 @root.command('validate-all')
@@ -206,7 +284,8 @@ def validate_all(fail):
 @click.argument('query', required=False)
 @click.option('--columns', '-c', multiple=True, help='Specify columns to add the table')
 @click.option('--language', type=click.Choice(["eql", "kql"]), default="kql")
-def search_rules(query, columns, language, verbose=True):
+@click.option('--count', is_flag=True, help='Return a count rather than table')
+def search_rules(query, columns, language, count, verbose=True, rules: Dict[str, dict] = None, pager=False):
     """Use KQL or EQL to find matching rules."""
     from kql import get_evaluator
     from eql.table import Table
@@ -215,16 +294,29 @@ def search_rules(query, columns, language, verbose=True):
     from eql.pipes import CountPipe
 
     flattened_rules = []
+    rules = rules or rule_loader.load_rule_files(verbose=verbose)
 
-    for file_name, rule_doc in rule_loader.load_rule_files().items():
+    for file_name, rule_doc in rules.items():
         flat = {"file": os.path.relpath(file_name)}
         flat.update(rule_doc)
         flat.update(rule_doc["metadata"])
         flat.update(rule_doc["rule"])
-        attacks = [threat for threat in rule_doc["rule"].get("threat", []) if threat["framework"] == "MITRE ATT&CK"]
-        techniques = [t["id"] for threat in attacks for t in threat.get("technique", [])]
-        tactics = [threat["tactic"]["name"] for threat in attacks]
-        flat.update(techniques=techniques, tactics=tactics)
+
+        tactic_names = []
+        technique_ids = []
+        subtechnique_ids = []
+
+        for entry in rule_doc['rule'].get('threat', []):
+            if entry["framework"] != "MITRE ATT&CK":
+                continue
+
+            techniques = entry.get('technique', [])
+            tactic_names.append(entry['tactic']['name'])
+            technique_ids.extend([t['id'] for t in techniques])
+            subtechnique_ids.extend([st['id'] for t in techniques for st in t.get('subtechnique', [])])
+
+        flat.update(techniques=technique_ids, tactics=tactic_names, subtechniques=subtechnique_ids,
+                    unique_fields=Rule.get_unique_query_fields(rule_doc['rule']))
         flattened_rules.append(flat)
 
     flattened_rules.sort(key=lambda dct: dct["name"])
@@ -241,6 +333,10 @@ def search_rules(query, columns, language, verbose=True):
         if not columns and any(isinstance(pipe, CountPipe) for pipe in parsed.pipes):
             columns = ["key", "count", "percent"]
 
+    if count:
+        click.echo(f'{len(filtered)} rules')
+        return filtered
+
     if columns:
         columns = ",".join(columns).split(",")
     else:
@@ -249,92 +345,9 @@ def search_rules(query, columns, language, verbose=True):
     table = Table.from_list(columns, filtered)
 
     if verbose:
-        click.echo(table)
+        click.echo_via_pager(table) if pager else click.echo(table)
 
     return filtered
-
-
-@root.command('build-release')
-@click.argument('config-file', type=click.Path(exists=True, dir_okay=False), required=False, default=PACKAGE_FILE)
-@click.option('--update-version-lock', '-u', is_flag=True,
-              help='Save version.lock.json file with updated rule versions in the package')
-def build_release(config_file, update_version_lock):
-    """Assemble all the rules into Kibana-ready release files."""
-    config = load_dump(config_file)['package']
-    click.echo('[+] Building package {}'.format(config.get('name')))
-    package = Package.from_config(config, update_version_lock=update_version_lock)
-    package.save()
-    package.get_package_hash(verbose=True)
-    click.echo('- {} rules included'.format(len(package.rules)))
-
-
-@root.command('update-lock-versions')
-@click.argument('rule-ids', nargs=-1, required=True)
-def update_lock_versions(rule_ids):
-    """Update rule hashes in version.lock.json file without bumping version."""
-    from .packaging import manage_versions
-
-    if not click.confirm('Are you sure you want to update hashes without a version bump?'):
-        return
-
-    rules = [r for r in rule_loader.load_rules(verbose=False).values() if r.id in rule_ids]
-    changed, new = manage_versions(rules, exclude_version_update=True, add_new=False, save_changes=True)
-
-    if not changed:
-        click.echo('No hashes updated')
-
-    return changed
-
-
-@root.command('kibana-diff')
-@click.option('--rule-id', '-r', multiple=True, help='Optionally specify rule ID')
-@click.option('--branch', '-b', default='master', help='Specify the kibana branch to diff against')
-def kibana_diff(rule_id, branch):
-    """Diff rules against their version represented in kibana if exists."""
-    from .misc import get_kibana_rules
-
-    if rule_id:
-        rules = [r for r in rule_loader.load_rules(verbose=False).values() if r.id in rule_id]
-    else:
-        rules = [r for r in rule_loader.load_rules(verbose=False).values() if r.metadata['maturity'] == 'production']
-
-    # add versions to the rules
-    manage_versions(rules, verbose=False)
-
-    rule_paths = [os.path.basename(r.path) for r in rules]
-    try:
-        original_gh_rules = get_kibana_rules(*rule_paths, branch=branch).values()
-    except ValueError as e:
-        click.secho(e.args[0], fg='red', err=True)
-        return
-
-    gh_rule_versions = {r['rule_id']: r.pop('version') for r in original_gh_rules}
-    rule_versions = {r.id: r.contents.pop('version') for r in rules}
-
-    gh_rules = {r['rule_id']: Rule('_', r) for r in original_gh_rules}
-
-    rule_ids = [r.id for r in rules]
-    gh_rule_ids = [r.id for r in gh_rules.values()]
-
-    missing_rules = [r for r in gh_rules.values() if r.id in list(set(gh_rule_ids).difference(set(rule_ids)))]
-
-    diff = {
-        'missing_from_kibana': [],
-        'diff': [],
-        'missing_from_rules': ['{} - {}'.format(r.id, r.name) for r in missing_rules]
-    }
-    for rule in rules:
-        if rule.id not in gh_rule_ids:
-            diff['missing_from_kibana'].append('{} - {}'.format(rule.id, rule.name))
-            continue
-
-        gh_rule = gh_rules[rule.id]
-
-        if rule.get_hash() != gh_rule.get_hash():
-            diff['diff'].append('versions - repo: {}, kibana: {} -> {} - {}'.format(
-                rule_versions[rule.id], gh_rule_versions[rule.id], rule.id, rule.name))
-
-    click.echo(json.dumps(diff, indent=2, sort_keys=True))
 
 
 @root.command("test")
